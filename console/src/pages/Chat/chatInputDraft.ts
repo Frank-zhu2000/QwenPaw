@@ -10,22 +10,33 @@
  *   another's input box.
  * - #8351: every conversation of one agent used to share
  *   `qwenpaw_chat_input_draft_<agentId>`. A real session id is part of the
- *   key, including when no agent id is selected. That legacy entry is never
- *   read back. `/chat` and `/chat/new` use a pending slot, and that draft is
- *   handed to the session once an id is allocated.
+ *   key, including when no agent id is selected. That legacy entry is
+ *   discarded, never copied: it has no conversation identity, so migrating
+ *   it would put stale text in whichever chat opened next. Each
+ *   not-yet-created composer gets
+ *   `qwenpaw_chat_input_draft_<agentId>_pending_<clientSideId>`. The id lives
+ *   in sessionStorage, so leaving and returning restores that composer
+ *   (#4774). Starting another new chat rotates the id. The draft is handed
+ *   to the real session key once an id is allocated, then the pending slot
+ *   is removed.
  * - #4774: navigating away and back must restore the draft exactly (value +
  *   cursor selection), and malformed/empty stored data must never throw.
  * - #8272: sending clears only the current conversation's draft.
  */
 
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useLoopStore } from "../../stores/loopStore";
 import { setTextareaValue } from "./utils";
 
 export const DRAFT_STORAGE_KEY_PREFIX = "qwenpaw_chat_input_draft";
 
-/** Blank-route slot. Distinct from the pre-#8351 per-agent key. */
-const PENDING_DRAFT_SUFFIX = "__pending";
+/** Sidebar sets this before navigating to /chat from another page. */
+const PENDING_NEW_CHAT_FLAG = "qwenpaw_pending_new_chat";
+
+/** sessionStorage key for the active pre-creation composer id. */
+const PENDING_COMPOSER_ID_PREFIX = "qwenpaw_chat_input_pending_composer";
+
+const PENDING_COMPOSER_ROTATED_EVENT = "qwenpaw:pending-composer-rotated";
 
 export interface DraftState {
   value: string;
@@ -40,11 +51,80 @@ export function getLegacyDraftStorageKey(agentId?: string): string {
     : DRAFT_STORAGE_KEY_PREFIX;
 }
 
+function pendingComposerStorageKey(agentId?: string): string {
+  return agentId
+    ? `${PENDING_COMPOSER_ID_PREFIX}_${agentId}`
+    : PENDING_COMPOSER_ID_PREFIX;
+}
+
+function pendingComposerArmedKey(agentId?: string): string {
+  return `${pendingComposerStorageKey(agentId)}_armed`;
+}
+
+function createPendingComposerId(): string {
+  if (
+    typeof crypto !== "undefined" &&
+    typeof crypto.randomUUID === "function"
+  ) {
+    return crypto.randomUUID();
+  }
+  return `${Date.now().toString(36)}-${Math.random()
+    .toString(36)
+    .slice(2, 10)}`;
+}
+
+function isBlankDraftSession(sessionId?: string): boolean {
+  return !sessionId || sessionId === "new";
+}
+
+/**
+ * Sidebar sets `qwenpaw_pending_new_chat` before navigating back to `/chat`.
+ * Mint once, before the composer reads storage, so the previous new chat is
+ * not restored. ChatSessionInitializer still owns removing the flag.
+ */
+function claimFreshPendingComposer(agentId?: string): void {
+  const armedKey = pendingComposerArmedKey(agentId);
+  if (sessionStorage.getItem(PENDING_NEW_CHAT_FLAG) !== "1") {
+    sessionStorage.removeItem(armedKey);
+    return;
+  }
+  if (sessionStorage.getItem(armedKey) === "1") return;
+  sessionStorage.setItem(armedKey, "1");
+  sessionStorage.setItem(
+    pendingComposerStorageKey(agentId),
+    createPendingComposerId(),
+  );
+}
+
+export function getPendingComposerId(agentId?: string): string {
+  claimFreshPendingComposer(agentId);
+  const key = pendingComposerStorageKey(agentId);
+  const existing = sessionStorage.getItem(key);
+  if (existing) return existing;
+  const id = createPendingComposerId();
+  sessionStorage.setItem(key, id);
+  return id;
+}
+
+/** Start a different pre-creation composer. The previous slot is left intact. */
+export function rotatePendingComposer(agentId?: string): string {
+  const id = createPendingComposerId();
+  sessionStorage.setItem(pendingComposerStorageKey(agentId), id);
+  window.dispatchEvent(
+    new CustomEvent(PENDING_COMPOSER_ROTATED_EVENT, {
+      detail: { agentId: agentId ?? "" },
+    }),
+  );
+  return id;
+}
+
 /**
  * Storage key for one conversation's draft.
  *
- * - No real session (missing, empty, or the explicit "new" route): one
- *   pending slot for that agent. This is not the legacy per-agent key.
+ * - No real session (missing, empty, or the explicit "new" route): this
+ *   composer's pending slot. `/chat` and `/chat/new` share it until a new
+ *   chat rotates the id. This is not the legacy per-agent key and not the
+ *   old shared `__pending` slot.
  * - Real session: `qwenpaw_chat_input_draft_<agentId>_<sessionId>`.
  *   A session id is still appended when the agent id is missing.
  */
@@ -53,24 +133,34 @@ export function getDraftStorageKey(
   sessionId?: string,
 ): string {
   const base = getLegacyDraftStorageKey(agentId);
-  if (!sessionId || sessionId === "new") {
-    return `${base}${PENDING_DRAFT_SUFFIX}`;
+  if (isBlankDraftSession(sessionId)) {
+    return `${base}_pending_${getPendingComposerId(agentId)}`;
   }
   return `${base}_${sessionId}`;
 }
 
-/** Drop a pre-#8351 per-agent entry so it cannot resurface later. */
+/**
+ * Drop entries that have no conversation identity.
+ *
+ * The pre-#8351 per-agent key and the shared `__pending` slot were visible
+ * to every composer of that agent. Copying either into the chat that happens
+ * to open next would resurface text in an unrelated conversation, so both
+ * are deleted and never migrated.
+ */
 export function discardLegacyDraft(agentId?: string): void {
   const legacy = getLegacyDraftStorageKey(agentId);
-  if (legacy !== getDraftStorageKey(agentId)) {
-    localStorage.removeItem(legacy);
-  }
+  const current = getDraftStorageKey(agentId);
+  if (legacy !== current) localStorage.removeItem(legacy);
+  const sharedPending = `${legacy}__pending`;
+  if (sharedPending !== current) localStorage.removeItem(sharedPending);
 }
 
 /**
- * Move the blank-route draft onto a session that was just allocated.
- * Does not copy the legacy per-agent entry. Drops the pending slot so the
- * next blank chat does not inherit this text.
+ * Move the active pre-creation draft onto a session that was just allocated.
+ * Does not copy the legacy per-agent entry or any other composer's slot.
+ * Drops this composer's pending slot so a later blank chat does not inherit
+ * the text. Does not rotate the composer id: the route is about to become
+ * the real session, and rotating here would clear the composer first.
  */
 export function handoverDraftToSession(
   agentId: string | undefined,
@@ -117,7 +207,27 @@ export function useChatInputDraft(
   agentId?: string,
   sessionId?: string,
 ) {
+  const blank = isBlankDraftSession(sessionId);
+  const [, bumpPendingComposer] = useState(0);
   const storageKey = getDraftStorageKey(agentId, sessionId);
+
+  useEffect(() => {
+    const onRotated = (event: Event) => {
+      const detail = (event as CustomEvent<{ agentId?: string }>).detail;
+      if ((detail?.agentId ?? "") !== (agentId ?? "")) return;
+      bumpPendingComposer((epoch) => epoch + 1);
+    };
+    const onNewChat = () => {
+      if (!blank) return;
+      rotatePendingComposer(agentId);
+    };
+    window.addEventListener(PENDING_COMPOSER_ROTATED_EVENT, onRotated);
+    window.addEventListener("qwenpaw:sidebar-new-chat", onNewChat);
+    return () => {
+      window.removeEventListener(PENDING_COMPOSER_ROTATED_EVENT, onRotated);
+      window.removeEventListener("qwenpaw:sidebar-new-chat", onNewChat);
+    };
+  }, [agentId, blank]);
 
   useEffect(() => {
     if (!active) return;

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   DRAFT_STORAGE_KEY_PREFIX,
   getDraftStorageKey,
+  handoverDraftToSession,
   parseDraft,
   serializeDraft,
 } from "./chatInputDraft";
@@ -91,15 +92,33 @@ describe("per-session chat input drafts (#8351)", () => {
     );
   });
 
-  it("uses one pending slot for /chat and /chat/new, not the legacy key", () => {
+  it("gives each pre-creation composer its own pending slot (#8351)", () => {
+    sessionStorage.clear();
+    localStorage.clear();
     const legacy = `${DRAFT_STORAGE_KEY_PREFIX}_agent-a`;
-    const pending = getDraftStorageKey("agent-a");
-    expect(pending).not.toBe(legacy);
-    expect(getDraftStorageKey("agent-a", undefined)).toBe(pending);
-    expect(getDraftStorageKey("agent-a", "")).toBe(pending);
-    expect(getDraftStorageKey("agent-a", "new")).toBe(pending);
-    expect(getDraftStorageKey("agent-a", "session-1")).not.toBe(pending);
+    const sharedPending = `${legacy}__pending`;
+    const first = getDraftStorageKey("agent-a");
+    // /chat and /chat/new are the same composer until a new one starts.
+    expect(getDraftStorageKey("agent-a", undefined)).toBe(first);
+    expect(getDraftStorageKey("agent-a", "")).toBe(first);
+    expect(getDraftStorageKey("agent-a", "new")).toBe(first);
+    expect(first).not.toBe(legacy);
+    expect(first).not.toBe(sharedPending);
+    expect(first.startsWith(`${legacy}_pending_`)).toBe(true);
+    expect(getDraftStorageKey("agent-a", "session-1")).not.toBe(first);
     expect(getDraftStorageKey("agent-a", "session-1")).not.toBe(legacy);
+
+    sessionStorage.clear();
+    const second = getDraftStorageKey("agent-a");
+    expect(second).not.toBe(first);
+    expect(second.startsWith(`${legacy}_pending_`)).toBe(true);
+    expect(
+      getDraftStorageKey("agent-b").startsWith(
+        `${DRAFT_STORAGE_KEY_PREFIX}_agent-b_pending_`,
+      ),
+    ).toBe(true);
+    sessionStorage.clear();
+    localStorage.clear();
   });
 
   it("restores the draft saved for that session and not another session", () => {
@@ -183,6 +202,41 @@ describe("per-session chat input drafts (#8351)", () => {
     expect(localStorage.getItem(sessionKey)).not.toContain("stale legacy");
     expect(localStorage.getItem(pending)).toBeNull();
     expect(localStorage.getItem(legacy)).toBeNull();
+    localStorage.clear();
+  });
+
+  it("hands over only the active pre-creation composer", () => {
+    sessionStorage.clear();
+    localStorage.clear();
+    const first = getDraftStorageKey("agent-a");
+    localStorage.setItem(
+      first,
+      JSON.stringify({
+        value: "first new",
+        selectionStart: 0,
+        selectionEnd: 0,
+      }),
+    );
+    sessionStorage.clear();
+    const second = getDraftStorageKey("agent-a");
+    localStorage.setItem(
+      second,
+      JSON.stringify({
+        value: "second new",
+        selectionStart: 1,
+        selectionEnd: 1,
+      }),
+    );
+    handoverDraftToSession("agent-a", "real-session");
+    expect(
+      localStorage.getItem(getDraftStorageKey("agent-a", "real-session")),
+    ).toContain("second new");
+    expect(localStorage.getItem(first)).toContain("first new");
+    expect(localStorage.getItem(second)).toBeNull();
+    expect(
+      localStorage.getItem(`${DRAFT_STORAGE_KEY_PREFIX}_agent-a`),
+    ).toBeNull();
+    sessionStorage.clear();
     localStorage.clear();
   });
 

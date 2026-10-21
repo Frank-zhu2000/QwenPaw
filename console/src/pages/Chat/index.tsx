@@ -1214,6 +1214,10 @@ export default function ChatPage() {
   const location = useLocation();
   const { isDark, previewTheme = {} } = useTheme();
   const { selectedAgent, agents } = useAgentStore();
+  // useLocation().pathname is already basename-relative. React Router
+  // strips the basename before exposing it (Desktop `/console/chat/<id>`
+  // is `/chat/<id>` here). Do not strip again: a basename of `/chat`
+  // would erase the session id. Raw window.location stays in hostSdk.
   const routeChatId = useMemo(
     () => getSessionIdFromPath(location.pathname),
     [location.pathname],
