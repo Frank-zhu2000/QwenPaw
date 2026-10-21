@@ -13,9 +13,10 @@ import {
 // ---------------------------------------------------------------------------
 describe("getDraftStorageKey (A#82689956)", () => {
   it("namespaces the key with the agent id", () => {
-    expect(getDraftStorageKey("agent-a")).toBe(
-      `${DRAFT_STORAGE_KEY_PREFIX}_agent-a`,
-    );
+    const key = getDraftStorageKey("agent-a");
+    expect(key).toContain(`${DRAFT_STORAGE_KEY_PREFIX}_agent-a`);
+    // The blank route must not reuse the pre-#8351 per-agent slot.
+    expect(key).not.toBe(`${DRAFT_STORAGE_KEY_PREFIX}_agent-a`);
   });
 
   it("produces distinct keys for distinct agents", () => {
@@ -26,13 +27,21 @@ describe("getDraftStorageKey (A#82689956)", () => {
     );
   });
 
-  it("falls back to the shared key without an agent id", () => {
-    expect(getDraftStorageKey()).toBe(DRAFT_STORAGE_KEY_PREFIX);
-    expect(getDraftStorageKey(undefined)).toBe(DRAFT_STORAGE_KEY_PREFIX);
+  it("does not use the legacy shared key when no agent id is selected", () => {
+    expect(getDraftStorageKey()).not.toBe(DRAFT_STORAGE_KEY_PREFIX);
+    expect(getDraftStorageKey(undefined)).not.toBe(DRAFT_STORAGE_KEY_PREFIX);
+    expect(getDraftStorageKey("")).not.toBe(DRAFT_STORAGE_KEY_PREFIX);
+    expect(getDraftStorageKey()).toBe(getDraftStorageKey(undefined));
+    expect(getDraftStorageKey()).toBe(getDraftStorageKey(""));
   });
 
-  it("falls back to the shared key for a falsy agent id", () => {
-    expect(getDraftStorageKey("")).toBe(DRAFT_STORAGE_KEY_PREFIX);
+  it("still appends a real session id when the agent id is missing", () => {
+    expect(getDraftStorageKey(undefined, "session-1")).toBe(
+      `${DRAFT_STORAGE_KEY_PREFIX}_session-1`,
+    );
+    expect(getDraftStorageKey(undefined, "session-1")).not.toBe(
+      getDraftStorageKey(undefined),
+    );
   });
 });
 
@@ -82,22 +91,15 @@ describe("per-session chat input drafts (#8351)", () => {
     );
   });
 
-  it("keeps the legacy per-agent key only when no session exists yet", () => {
-    expect(getDraftStorageKey("agent-a")).toBe(
-      `${DRAFT_STORAGE_KEY_PREFIX}_agent-a`,
-    );
-    expect(getDraftStorageKey("agent-a", undefined)).toBe(
-      `${DRAFT_STORAGE_KEY_PREFIX}_agent-a`,
-    );
-    expect(getDraftStorageKey("agent-a", "")).toBe(
-      `${DRAFT_STORAGE_KEY_PREFIX}_agent-a`,
-    );
-    expect(getDraftStorageKey("agent-a", "new")).toBe(
-      `${DRAFT_STORAGE_KEY_PREFIX}_agent-a`,
-    );
-    expect(getDraftStorageKey("agent-a", "session-1")).not.toBe(
-      getDraftStorageKey("agent-a"),
-    );
+  it("uses one pending slot for /chat and /chat/new, not the legacy key", () => {
+    const legacy = `${DRAFT_STORAGE_KEY_PREFIX}_agent-a`;
+    const pending = getDraftStorageKey("agent-a");
+    expect(pending).not.toBe(legacy);
+    expect(getDraftStorageKey("agent-a", undefined)).toBe(pending);
+    expect(getDraftStorageKey("agent-a", "")).toBe(pending);
+    expect(getDraftStorageKey("agent-a", "new")).toBe(pending);
+    expect(getDraftStorageKey("agent-a", "session-1")).not.toBe(pending);
+    expect(getDraftStorageKey("agent-a", "session-1")).not.toBe(legacy);
   });
 
   it("restores the draft saved for that session and not another session", () => {
@@ -115,17 +117,73 @@ describe("per-session chat input drafts (#8351)", () => {
     expect(storage.get("agent-b", "session-a")).toBeNull();
   });
 
-  it("does not load a legacy per-agent draft into every session", () => {
+  it("does not load a blank-route draft into every session", () => {
     const storage = memory();
     storage.set("agent-a", undefined, {
-      value: "stale shared draft",
+      value: "unsent new chat",
       selectionStart: 0,
       selectionEnd: 0,
     });
 
     expect(storage.get("agent-a", "session-a")).toBeNull();
     expect(storage.get("agent-a", "session-b")).toBeNull();
-    expect(storage.get("agent-a")?.value).toBe("stale shared draft");
+    expect(storage.get("agent-a")?.value).toBe("unsent new chat");
+    expect(storage.get("agent-a", "new")?.value).toBe("unsent new chat");
+  });
+
+  it("does not copy a legacy per-agent value into a session or a new chat", async () => {
+    localStorage.clear();
+    const legacy = `${DRAFT_STORAGE_KEY_PREFIX}_agent-a`;
+    localStorage.setItem(
+      legacy,
+      JSON.stringify({
+        value: "stale legacy",
+        selectionStart: 0,
+        selectionEnd: 0,
+      }),
+    );
+    const draftModule = await import("./chatInputDraft");
+    expect(draftModule.handoverDraftToSession).toEqual(expect.any(Function));
+    draftModule.handoverDraftToSession("agent-a", "real-session");
+    expect(
+      localStorage.getItem(getDraftStorageKey("agent-a", "real-session")),
+    ).toBeNull();
+    expect(localStorage.getItem(getDraftStorageKey("agent-a"))).toBeNull();
+    expect(localStorage.getItem(legacy)).toBeNull();
+    localStorage.clear();
+  });
+
+  it("moves the blank-route draft onto the session that was just allocated", async () => {
+    localStorage.clear();
+    const pending = getDraftStorageKey("agent-a");
+    const legacy = `${DRAFT_STORAGE_KEY_PREFIX}_agent-a`;
+    const sessionKey = getDraftStorageKey("agent-a", "real-session");
+    localStorage.setItem(
+      pending,
+      JSON.stringify({
+        value: "follow up",
+        selectionStart: 2,
+        selectionEnd: 4,
+      }),
+    );
+    if (legacy !== pending) {
+      localStorage.setItem(
+        legacy,
+        JSON.stringify({
+          value: "stale legacy",
+          selectionStart: 0,
+          selectionEnd: 0,
+        }),
+      );
+    }
+    const { handoverDraftToSession } = await import("./chatInputDraft");
+    expect(handoverDraftToSession).toEqual(expect.any(Function));
+    handoverDraftToSession("agent-a", "real-session");
+    expect(localStorage.getItem(sessionKey)).toContain("follow up");
+    expect(localStorage.getItem(sessionKey)).not.toContain("stale legacy");
+    expect(localStorage.getItem(pending)).toBeNull();
+    expect(localStorage.getItem(legacy)).toBeNull();
+    localStorage.clear();
   });
 
   it("removes an empty draft from that session only", () => {

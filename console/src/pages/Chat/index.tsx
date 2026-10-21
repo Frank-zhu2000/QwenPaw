@@ -51,9 +51,8 @@ import { useLocation, useNavigate } from "react-router-dom";
 import sessionApi from "./sessionApi";
 import {
   getDraftStorageKey,
-  parseDraft,
-  serializeDraft,
-  type DraftState,
+  handoverDraftToSession,
+  useChatInputDraft,
 } from "./chatInputDraft";
 import {
   stopBackgroundQueue,
@@ -1130,110 +1129,6 @@ function useMessageHistoryNavigation(
       document.removeEventListener("focusin", handleFocus, true);
     };
   }, [isChatActive, isComposingRef, getUserMessagesWithText]);
-}
-
-// ---------------------------------------------------------------------------
-// Chat input draft persistence
-// ---------------------------------------------------------------------------
-
-function useChatInputDraft(
-  active: boolean,
-  agentId?: string,
-  sessionId?: string,
-) {
-  const storageKey = getDraftStorageKey(agentId, sessionId);
-
-  useEffect(() => {
-    if (!active) return;
-
-    const getTextarea = (): HTMLTextAreaElement | null => {
-      const sender = document.querySelector('[class*="sender"]');
-      return sender?.querySelector("textarea") as HTMLTextAreaElement | null;
-    };
-
-    const saveDraft = (textarea: HTMLTextAreaElement) => {
-      const draft: DraftState = {
-        value: textarea.value,
-        selectionStart: textarea.selectionStart,
-        selectionEnd: textarea.selectionEnd,
-      };
-      const serialized = serializeDraft(draft);
-      if (serialized) {
-        localStorage.setItem(storageKey, serialized);
-      } else {
-        localStorage.removeItem(storageKey);
-      }
-    };
-
-    const handleInput = (e: Event) => {
-      const target = e.target as HTMLElement;
-      if (target?.tagName !== "TEXTAREA") return;
-      if (!target?.closest('[class*="sender"]')) return;
-
-      saveDraft(target as HTMLTextAreaElement);
-
-      // Minimal loop mode detection: sync indicator with availableModes
-      const val = (target as HTMLTextAreaElement).value.trimStart();
-      const modes = useLoopStore.getState().availableModes;
-      const match = modes.find((m) => {
-        if (!m.slash_command) return false;
-        const prefix = `/${m.slash_command}`;
-        // Match "/cmd" or "/cmd " exactly, avoid "/cmdxxx"
-        return val === prefix || val.startsWith(`${prefix} `);
-      });
-      if (match) useLoopStore.getState().setSelectedMode(match.id);
-    };
-
-    // Read once, before the input listener, so a session switch cannot save
-    // the previous conversation's text into this session's slot (#8351).
-    const storedDraft = parseDraft(localStorage.getItem(storageKey));
-    const applyStoredDraft = (textarea: HTMLTextAreaElement) => {
-      if (storedDraft) {
-        setTextareaValue(textarea, storedDraft.value);
-        requestAnimationFrame(() => {
-          textarea.selectionStart = storedDraft.selectionStart;
-          textarea.selectionEnd = storedDraft.selectionEnd;
-        });
-        return;
-      }
-      if (textarea.value) setTextareaValue(textarea, "");
-    };
-
-    document.addEventListener("input", handleInput, true);
-
-    // The sender textarea can already be mounted when the session changes.
-    // Replace its value before the browser handles another keystroke.
-    // setTextareaValue dispatches input only after the new value is in place,
-    // so this save records the session's own draft (or clears an empty one).
-    const existingTextarea = getTextarea();
-    if (existingTextarea) applyStoredDraft(existingTextarea);
-
-    // Restore draft on mount with polling for textarea readiness.
-    let restoreAttempts = 0;
-    const maxRestoreAttempts = 20;
-    const restoreInterval = setInterval(() => {
-      restoreAttempts++;
-      const textarea = getTextarea();
-      if (textarea) {
-        clearInterval(restoreInterval);
-        // A node that mounts later starts empty. Fill it from this session
-        // only; do not wipe text the user already typed into it.
-        if (textarea !== existingTextarea && !textarea.value && storedDraft) {
-          applyStoredDraft(textarea);
-        }
-      } else if (restoreAttempts >= maxRestoreAttempts) {
-        clearInterval(restoreInterval);
-      }
-    }, 100);
-
-    return () => {
-      clearInterval(restoreInterval);
-      document.removeEventListener("input", handleInput, true);
-
-      // Input events already saved the draft. Cleanup must not overwrite it
-      // with a cleared/remounted composer (including another browser tab).
-    };
-  }, [active, storageKey]);
 }
 
 function RuntimeLoadingBridge({
@@ -3011,6 +2906,9 @@ export default function ChatPage() {
       if (!isChatActiveRef.current) return;
       const agentId = selectedAgentRef.current;
       migrateSessionResources(agentId, tempId, realId);
+      // The first send stays on /chat until this id exists. Move the
+      // follow-up typed there onto the new session before the route changes.
+      handoverDraftToSession(agentId, realId);
       lastSessionIdRef.current = realId;
       sessionApi.trackNavigatedSession(
         realId,
@@ -3187,6 +3085,7 @@ export default function ChatPage() {
         removeLastChatIdRef.current(selectedAgentRef.current);
       } else {
         setLastChatIdRef.current(selectedAgentRef.current, sessionId);
+        handoverDraftToSession(agentId, sessionId);
       }
       navigateRef.current(
         isLocalTimestampId(sessionId)

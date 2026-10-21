@@ -2950,6 +2950,122 @@ describe("ChatPage coverage", () => {
     localStorage.removeItem(key);
   });
 
+  function ComposerHarness() {
+    return (
+      <>
+        <div className="sender">
+          <textarea aria-label="composer" />
+        </div>
+        <ChatPage />
+      </>
+    );
+  }
+
+  function composerTextarea(): HTMLTextAreaElement {
+    const textarea = screen.getByRole("textbox", { name: "composer" });
+    if (!(textarea instanceof HTMLTextAreaElement)) {
+      throw new Error("composer is not a textarea");
+    }
+    return textarea;
+  }
+
+  it("does not restore a legacy per-agent draft into a new chat", async () => {
+    localStorage.clear();
+    const legacy = "qwenpaw_chat_input_draft_default";
+    localStorage.setItem(
+      legacy,
+      JSON.stringify({
+        value: "stale legacy",
+        selectionStart: 0,
+        selectionEnd: 0,
+      }),
+    );
+    const { setTextareaValue } = await import("./utils");
+    vi.mocked(setTextareaValue).mockClear();
+    renderWithProviders(<ComposerHarness />, { initialEntries: ["/chat"] });
+    await screen.findByTestId("chat-ui");
+    expect(vi.mocked(setTextareaValue)).not.toHaveBeenCalledWith(
+      expect.anything(),
+      "stale legacy",
+    );
+    expect(localStorage.getItem(legacy)).toBeNull();
+    localStorage.clear();
+  });
+
+  it("keeps text typed on /chat when that chat receives a real session id", async () => {
+    localStorage.clear();
+    renderWithProviders(<ComposerHarness />, { initialEntries: ["/chat"] });
+    await screen.findByTestId("chat-ui");
+    const textarea = composerTextarea();
+    textarea.value = "follow up";
+    textarea.selectionStart = 9;
+    textarea.selectionEnd = 9;
+    fireEvent.input(textarea);
+
+    const { getDraftStorageKey } = await import("./chatInputDraft");
+    const pending = getDraftStorageKey("default");
+    expect(localStorage.getItem(pending)).toContain("follow up");
+
+    const legacy = "qwenpaw_chat_input_draft_default";
+    if (legacy !== pending) {
+      localStorage.setItem(
+        legacy,
+        JSON.stringify({
+          value: "stale legacy",
+          selectionStart: 0,
+          selectionEnd: 0,
+        }),
+      );
+    }
+
+    const realId = "75590000-0000-4000-8000-000000000099";
+    const session = (await import("./sessionApi")).default as {
+      onSessionIdResolved: ((tempId: string, realId: string) => void) | null;
+    };
+    expect(session.onSessionIdResolved).toEqual(expect.any(Function));
+    const { setTextareaValue } = await import("./utils");
+    vi.mocked(setTextareaValue).mockClear();
+    await act(async () => {
+      session.onSessionIdResolved?.("1710000000000-ab12", realId);
+    });
+
+    const sessionKey = getDraftStorageKey("default", realId);
+    await waitFor(() => {
+      expect(localStorage.getItem(sessionKey)).toContain("follow up");
+    });
+    const applied = vi
+      .mocked(setTextareaValue)
+      .mock.calls.map((call) => call[1]);
+    expect(applied).toContain("follow up");
+    expect(applied).not.toContain("");
+    expect(localStorage.getItem(sessionKey)).not.toContain("stale legacy");
+    expect(localStorage.getItem(pending)).toBeNull();
+    expect(localStorage.getItem(legacy)).toBeNull();
+    localStorage.clear();
+  });
+
+  it("does not move a blank-route draft onto a local timestamp id", async () => {
+    localStorage.clear();
+    renderWithProviders(<ComposerHarness />, { initialEntries: ["/chat"] });
+    await screen.findByTestId("chat-ui");
+    const textarea = composerTextarea();
+    textarea.value = "still drafting";
+    fireEvent.input(textarea);
+    const { getDraftStorageKey } = await import("./chatInputDraft");
+    const pending = getDraftStorageKey("default");
+    const session = (await import("./sessionApi")).default as {
+      onSessionCreated: ((sessionId: string) => void) | null;
+    };
+    await act(async () => {
+      session.onSessionCreated?.("1710000000000-ab12");
+    });
+    expect(localStorage.getItem(pending)).toContain("still drafting");
+    expect(
+      localStorage.getItem(getDraftStorageKey("default", "1710000000000-ab12")),
+    ).toBeNull();
+    localStorage.clear();
+  });
+
   // ── customFetch with session in input ──────────────────────────────────
   it("customFetch extracts session from input", async () => {
     const mockResponse = { ok: true, status: 200, body: null };
