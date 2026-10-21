@@ -37,6 +37,122 @@ describe("getDraftStorageKey (A#82689956)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Per-session drafts — regression for #8351
+// (one agent shares many conversations; the storage key must include the
+// session so an unsent draft does not appear in the agent's other sessions.
+// A legacy per-agent entry must not be read back for every session.)
+// ---------------------------------------------------------------------------
+describe("per-session chat input drafts (#8351)", () => {
+  const memory = () => {
+    const items = new Map<string, string>();
+    return {
+      get(agentId?: string, sessionId?: string) {
+        return parseDraft(
+          items.get(getDraftStorageKey(agentId, sessionId)) ?? null,
+        );
+      },
+      set(
+        agentId: string | undefined,
+        sessionId: string | undefined,
+        draft: { value: string; selectionStart: number; selectionEnd: number },
+      ) {
+        const key = getDraftStorageKey(agentId, sessionId);
+        const serialized = serializeDraft(draft);
+        if (serialized) items.set(key, serialized);
+        else items.delete(key);
+      },
+      raw(agentId?: string, sessionId?: string) {
+        return items.get(getDraftStorageKey(agentId, sessionId)) ?? null;
+      },
+    };
+  };
+
+  it("keys a saved draft by agent and session", () => {
+    expect(getDraftStorageKey("agent-a", "session-1")).toBe(
+      `${DRAFT_STORAGE_KEY_PREFIX}_agent-a_session-1`,
+    );
+  });
+
+  it("gives each session of one agent its own key", () => {
+    expect(getDraftStorageKey("agent-a", "session-1")).not.toBe(
+      getDraftStorageKey("agent-a", "session-2"),
+    );
+    expect(getDraftStorageKey("agent-a", "session-1")).not.toBe(
+      getDraftStorageKey("agent-b", "session-1"),
+    );
+  });
+
+  it("keeps the legacy per-agent key only when no session exists yet", () => {
+    expect(getDraftStorageKey("agent-a")).toBe(
+      `${DRAFT_STORAGE_KEY_PREFIX}_agent-a`,
+    );
+    expect(getDraftStorageKey("agent-a", undefined)).toBe(
+      `${DRAFT_STORAGE_KEY_PREFIX}_agent-a`,
+    );
+    expect(getDraftStorageKey("agent-a", "")).toBe(
+      `${DRAFT_STORAGE_KEY_PREFIX}_agent-a`,
+    );
+    expect(getDraftStorageKey("agent-a", "new")).toBe(
+      `${DRAFT_STORAGE_KEY_PREFIX}_agent-a`,
+    );
+    expect(getDraftStorageKey("agent-a", "session-1")).not.toBe(
+      getDraftStorageKey("agent-a"),
+    );
+  });
+
+  it("restores the draft saved for that session and not another session", () => {
+    const storage = memory();
+    const draftA = { value: "only A", selectionStart: 1, selectionEnd: 4 };
+    storage.set("agent-a", "session-a", draftA);
+    storage.set("agent-a", "session-b", {
+      value: "only B",
+      selectionStart: 0,
+      selectionEnd: 0,
+    });
+
+    expect(storage.get("agent-a", "session-a")).toEqual(draftA);
+    expect(storage.get("agent-a", "session-b")?.value).toBe("only B");
+    expect(storage.get("agent-b", "session-a")).toBeNull();
+  });
+
+  it("does not load a legacy per-agent draft into every session", () => {
+    const storage = memory();
+    storage.set("agent-a", undefined, {
+      value: "stale shared draft",
+      selectionStart: 0,
+      selectionEnd: 0,
+    });
+
+    expect(storage.get("agent-a", "session-a")).toBeNull();
+    expect(storage.get("agent-a", "session-b")).toBeNull();
+    expect(storage.get("agent-a")?.value).toBe("stale shared draft");
+  });
+
+  it("removes an empty draft from that session only", () => {
+    const storage = memory();
+    storage.set("agent-a", "session-a", {
+      value: "gone",
+      selectionStart: 0,
+      selectionEnd: 0,
+    });
+    storage.set("agent-a", "session-b", {
+      value: "keep",
+      selectionStart: 2,
+      selectionEnd: 2,
+    });
+    storage.set("agent-a", "session-a", {
+      value: "",
+      selectionStart: 0,
+      selectionEnd: 0,
+    });
+
+    expect(storage.get("agent-a", "session-a")).toBeNull();
+    expect(storage.raw("agent-a", "session-a")).toBeNull();
+    expect(storage.get("agent-a", "session-b")?.value).toBe("keep");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // serializeDraft / parseDraft — regression for #4774
 // (navigating away and back must restore the draft exactly; empty drafts
 // must be removed, malformed stored data must never throw)

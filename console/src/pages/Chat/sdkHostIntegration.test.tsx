@@ -928,7 +928,7 @@ describe("ChatPage coverage", () => {
     });
     expect(capturedOptions.session.currentSessionId).toBe(target);
     const { getDraftStorageKey } = await import("./chatInputDraft");
-    const draftKey = getDraftStorageKey("default");
+    const draftKey = getDraftStorageKey("default", target);
     localStorage.setItem(draftKey, "new route draft");
     let result: unknown;
     await act(async () => {
@@ -2871,7 +2871,10 @@ describe("ChatPage coverage", () => {
       });
       await screen.findByTestId("chat-ui");
       const { getDraftStorageKey } = await import("./chatInputDraft");
-      const key = getDraftStorageKey("default");
+      const key = getDraftStorageKey(
+        "default",
+        route === "/chat" ? undefined : "test-session",
+      );
       // Direct submission is available only after history and ownership settle.
       const { holdOwnershipLock } = await import("@/stores/messageQueueStore");
       await waitFor(() =>
@@ -2926,7 +2929,7 @@ describe("ChatPage coverage", () => {
       ),
     );
     const { getDraftStorageKey } = await import("./chatInputDraft");
-    const key = getDraftStorageKey("default");
+    const key = getDraftStorageKey("default", chatId);
     localStorage.setItem(key, "submitted-draft");
     let finish!: (status: { status: string }) => void;
     mockGetChatStatus.mockImplementationOnce(

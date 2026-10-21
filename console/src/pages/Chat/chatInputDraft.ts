@@ -3,13 +3,16 @@
  *
  * Extracted from Chat/index.tsx so the draft contract can be unit-tested
  * without rendering the (very large) Chat page. The draft hook
- * (`useChatInputDraft`) stays in index.tsx and consumes these helpers;
- * behaviour is unchanged.
+ * (`useChatInputDraft`) stays in index.tsx and consumes these helpers.
  *
  * Regressions guarded here:
  * - A#82689956: drafts must be isolated per agent (storage key carries the
  *   agent id), otherwise switching agents leaks one agent's draft into
  *   another's input box.
+ * - #8351: drafts must also be isolated per session. A real session never
+ *   reads the legacy per-agent key, so an old shared draft cannot appear in
+ *   every conversation. A conversation that does not exist yet (no session
+ *   id, or the explicit "new" route) still uses that per-agent slot.
  * - #4774: navigating away and back must restore the draft exactly (value +
  *   cursor selection), and malformed/empty stored data must never throw.
  */
@@ -23,15 +26,26 @@ export interface DraftState {
 }
 
 /**
- * Storage key for an agent's draft. With an agent id the key is namespaced
- * (`qwenpaw_chat_input_draft_<agentId>`); without one it falls back to the
- * shared key. Distinct keys per agent are what keep drafts from leaking
- * across agents (A#82689956).
+ * Storage key for one conversation's draft.
+ *
+ * - No agent id: the shared key (`qwenpaw_chat_input_draft`).
+ * - Agent, no session yet: `qwenpaw_chat_input_draft_<agentId>` (also the
+ *   legacy slot from before drafts were per session).
+ * - Agent and session: `qwenpaw_chat_input_draft_<agentId>_<sessionId>`.
+ *
+ * Callers must not fall back from a session key to the legacy per-agent key.
+ * That fallback is what copied one unsent draft into every session (#8351).
+ * The explicit `new` route is not a session; it keeps the per-agent slot.
  */
-export function getDraftStorageKey(agentId?: string): string {
-  return agentId
+export function getDraftStorageKey(
+  agentId?: string,
+  sessionId?: string,
+): string {
+  const agentKey = agentId
     ? `${DRAFT_STORAGE_KEY_PREFIX}_${agentId}`
     : DRAFT_STORAGE_KEY_PREFIX;
+  if (!sessionId || sessionId === "new") return agentKey;
+  return `${agentKey}_${sessionId}`;
 }
 
 /**

@@ -1136,8 +1136,12 @@ function useMessageHistoryNavigation(
 // Chat input draft persistence
 // ---------------------------------------------------------------------------
 
-function useChatInputDraft(active: boolean, agentId?: string) {
-  const storageKey = getDraftStorageKey(agentId);
+function useChatInputDraft(
+  active: boolean,
+  agentId?: string,
+  sessionId?: string,
+) {
+  const storageKey = getDraftStorageKey(agentId, sessionId);
 
   useEffect(() => {
     if (!active) return;
@@ -1180,7 +1184,31 @@ function useChatInputDraft(active: boolean, agentId?: string) {
       if (match) useLoopStore.getState().setSelectedMode(match.id);
     };
 
-    // Restore draft on mount with polling for textarea readiness
+    // Read once, before the input listener, so a session switch cannot save
+    // the previous conversation's text into this session's slot (#8351).
+    const storedDraft = parseDraft(localStorage.getItem(storageKey));
+    const applyStoredDraft = (textarea: HTMLTextAreaElement) => {
+      if (storedDraft) {
+        setTextareaValue(textarea, storedDraft.value);
+        requestAnimationFrame(() => {
+          textarea.selectionStart = storedDraft.selectionStart;
+          textarea.selectionEnd = storedDraft.selectionEnd;
+        });
+        return;
+      }
+      if (textarea.value) setTextareaValue(textarea, "");
+    };
+
+    document.addEventListener("input", handleInput, true);
+
+    // The sender textarea can already be mounted when the session changes.
+    // Replace its value before the browser handles another keystroke.
+    // setTextareaValue dispatches input only after the new value is in place,
+    // so this save records the session's own draft (or clears an empty one).
+    const existingTextarea = getTextarea();
+    if (existingTextarea) applyStoredDraft(existingTextarea);
+
+    // Restore draft on mount with polling for textarea readiness.
     let restoreAttempts = 0;
     const maxRestoreAttempts = 20;
     const restoreInterval = setInterval(() => {
@@ -1188,21 +1216,15 @@ function useChatInputDraft(active: boolean, agentId?: string) {
       const textarea = getTextarea();
       if (textarea) {
         clearInterval(restoreInterval);
-        // parseDraft fails soft on missing/malformed/empty stored data
-        const draft = parseDraft(localStorage.getItem(storageKey));
-        if (draft) {
-          setTextareaValue(textarea, draft.value);
-          requestAnimationFrame(() => {
-            textarea.selectionStart = draft.selectionStart;
-            textarea.selectionEnd = draft.selectionEnd;
-          });
+        // A node that mounts later starts empty. Fill it from this session
+        // only; do not wipe text the user already typed into it.
+        if (textarea !== existingTextarea && !textarea.value && storedDraft) {
+          applyStoredDraft(textarea);
         }
       } else if (restoreAttempts >= maxRestoreAttempts) {
         clearInterval(restoreInterval);
       }
     }, 100);
-
-    document.addEventListener("input", handleInput, true);
 
     return () => {
       clearInterval(restoreInterval);
@@ -2437,7 +2459,7 @@ export default function ChatPage() {
   }, []);
 
   useMessageHistoryNavigation(chatRef, isChatActive, isComposingRef);
-  useChatInputDraft(isChatActiveRef.current, selectedAgent);
+  useChatInputDraft(isChatActiveRef.current, selectedAgent, routeChatId);
   // ── Message Queue ───────────────────────────────────────────────────────
 
   // Stop background sender for THIS session when ChatPage mounts (foreground
@@ -3688,7 +3710,7 @@ export default function ChatPage() {
       const backendChatId = resolveBackendChatId(chatIdRef.current);
       const textarea = getActiveSenderTextarea();
       const val = data.query.trim() || textarea?.value.trim() || "";
-      const draftStorageKey = getDraftStorageKey(selectedAgent);
+      const draftStorageKey = getDraftStorageKey(selectedAgent, chatId);
       const submittedDraft = localStorage.getItem(draftStorageKey);
       const submittedFiles = new Set(pendingFileListRef.current);
       const submittedAttachments = getSubmissionAttachments(data);
@@ -3750,7 +3772,7 @@ export default function ChatPage() {
         });
         if (sameVisit) {
           pendingFileListRef.current = [];
-          localStorage.removeItem(getDraftStorageKey(selectedAgent));
+          localStorage.removeItem(getDraftStorageKey(selectedAgent, chatId));
         } else if (
           enqueueIdentity.sessionId &&
           backendChatId &&
