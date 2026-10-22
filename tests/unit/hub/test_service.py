@@ -261,6 +261,43 @@ def test_managed_runtime_rejects_non_loopback_host(tmp_path: Path) -> None:
     assert service.get(created.runtime_id).state is RuntimeState.CREATED
 
 
+class _ContainerEndpointProvisioner(_FakeProvisioner):
+    """Allow the one non-loopback host a containerized Hub can reach."""
+
+    def managed_endpoint_allowed(self, host: str) -> bool:
+        return host in {"127.0.0.1", "localhost", "host.docker.internal"}
+
+
+def test_start_accepts_container_runtime_endpoint(tmp_path: Path) -> None:
+    provisioner = _ContainerEndpointProvisioner()
+    service = _service_with_provisioner(tmp_path, provisioner)
+    created = service.create(_spec("runtime-a"))
+    service.registry.save(
+        replace(created, host="host.docker.internal", port=8088),
+    )
+
+    started = service.start(created.runtime_id)
+
+    assert started.state is RuntimeState.RUNNING
+    assert started.host == "host.docker.internal"
+    assert provisioner.start_calls == 1
+
+
+def test_start_rejects_arbitrary_host_beside_container_endpoint(
+    tmp_path: Path,
+) -> None:
+    provisioner = _ContainerEndpointProvisioner()
+    service = _service_with_provisioner(tmp_path, provisioner)
+    created = service.create(_spec("runtime-a"))
+    service.registry.save(replace(created, host="192.0.2.10"))
+
+    with pytest.raises(ValueError, match="loopback-only"):
+        service.start(created.runtime_id)
+
+    assert service.get(created.runtime_id).state is RuntimeState.CREATED
+    assert provisioner.start_calls == 0
+
+
 def test_running_runtime_limit_is_global(tmp_path: Path) -> None:
     service = _service(
         tmp_path,

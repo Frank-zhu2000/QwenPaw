@@ -286,7 +286,13 @@ def create_hub_app(  # pylint: disable=too-many-statements
     app.state.docker_pulls = docker_pulls
 
     def require_loopback_runtime(record: RuntimeRecord) -> None:
-        if not is_loopback_host(record.host):
+        provisioner = runtime_service.provisioners.get(record.provisioner)
+        endpoint_allowed = (
+            provisioner.managed_endpoint_allowed(record.host)
+            if provisioner is not None
+            else is_loopback_host(record.host)
+        )
+        if not endpoint_allowed:
             raise HTTPException(
                 status_code=503,
                 detail="Managed runtime endpoint must be loopback-only",

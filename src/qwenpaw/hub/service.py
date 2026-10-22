@@ -224,7 +224,13 @@ class RuntimeService:
         record = self._status_locked(runtime_id)
         if record.state is RuntimeState.RUNNING:
             return record
-        if not is_loopback_host(record.host):
+        provisioner = self.provisioners.get(record.provisioner)
+        endpoint_allowed = (
+            provisioner.managed_endpoint_allowed(record.host)
+            if provisioner is not None
+            else is_loopback_host(record.host)
+        )
+        if not endpoint_allowed:
             raise ValueError("Managed runtime host must be loopback-only.")
         self.require_provisioner_available(record.provisioner)
         failure_metadata = record.metadata

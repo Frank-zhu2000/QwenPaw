@@ -17,6 +17,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+from ..config.utils import is_running_in_container
 from .credentials import runtime_credential_name_allowed
 from .models import RuntimeRecord, RuntimeState
 from .user_profile import runtime_workspace
@@ -120,6 +121,36 @@ class DockerRuntimeProvisioner(RuntimeProvisioner):
             ):
                 return RuntimeModelNetwork(str(address), str(address))
         raise RuntimeError("Docker bridge has no private IPv4 gateway")
+
+    def endpoint_host(self) -> str:
+        """Return the address Hub uses to reach a published runtime port.
+
+        A Hub on the host shares the engine loopback where the port is
+        published. A Hub inside a container uses the same host
+        ``model_network()`` gives that container for the engine:
+        ``host.docker.internal`` on Docker Desktop, or the bridge
+        gateway on native Linux.
+        """
+        cached = getattr(self, "_endpoint_host", None)
+        if isinstance(cached, str):
+            return cached
+        if not is_running_in_container():
+            resolved = "127.0.0.1"
+        else:
+            resolved = self.model_network().runtime_host
+        self._endpoint_host = resolved
+        return resolved
+
+    def managed_endpoint_allowed(self, host: str) -> bool:
+        """Allow loopback or this deployment's single container route."""
+        normalized = host.strip().strip("[]")
+        if super().managed_endpoint_allowed(normalized):
+            return True
+        try:
+            allowed = self.endpoint_host()
+        except Exception:
+            return False
+        return normalized.casefold() == allowed.casefold()
 
     def configure(self, config: Mapping[str, object]) -> None:
         """Apply validated Docker defaults and resource limits."""
@@ -247,7 +278,7 @@ class DockerRuntimeProvisioner(RuntimeProvisioner):
             port = self._published_port(container)
             starting = replace(
                 record,
-                host="127.0.0.1",
+                host=self.endpoint_host(),
                 port=port,
                 state=RuntimeState.STARTING,
                 pid=None,

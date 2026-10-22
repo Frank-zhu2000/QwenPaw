@@ -188,6 +188,189 @@ def test_engine_model_access_rejects_unusable_gateway(
         provisioner.model_network().url(43123)
 
 
+class _EndpointClient(_FakeClient):
+    """Engine whose OS string and bridge gateway are fixed."""
+
+    def __init__(
+        self,
+        operating_system: str,
+        gateway: str | None,
+    ) -> None:
+        super().__init__()
+        config: list[dict[str, str]] = []
+        if gateway is not None:
+            config = [{"Gateway": gateway}]
+        network = SimpleNamespace(
+            id="isolated-network",
+            attrs={
+                "IPAM": {"Config": config},
+                "Options": {
+                    "com.docker.network.bridge.enable_icc": "false",
+                },
+            },
+        )
+        self.networks = SimpleNamespace(get=lambda _name: network)
+        self._operating_system = operating_system
+
+    def info(self) -> dict[str, str]:
+        return {
+            "OSType": "linux",
+            "OperatingSystem": self._operating_system,
+        }
+
+
+def _record_readiness_urls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[str]:
+    """Capture readiness URLs and accept the token boundary."""
+    seen: list[str] = []
+
+    class _Response:
+        status = 200
+
+        def __enter__(self) -> "_Response":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+    def urlopen(
+        request: str | urllib.request.Request,
+        timeout: int,
+    ) -> _Response:
+        del timeout
+        if isinstance(request, str):
+            seen.append(request)
+            raise urllib.error.HTTPError(
+                request,
+                401,
+                "Unauthorized",
+                Message(),
+                None,
+            )
+        seen.append(request.full_url)
+        return _Response()
+
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    return seen
+
+
+def _start_for_endpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    in_container: bool,
+    platform: str,
+    operating_system: str,
+    gateway: str | None,
+) -> tuple[str, list[str], DockerRuntimeProvisioner]:
+    """Launch one runtime and return its stored host and probe URLs."""
+    monkeypatch.setattr(
+        docker_module,
+        "is_running_in_container",
+        lambda: in_container,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        docker_module,
+        "sys",
+        SimpleNamespace(platform=platform),
+    )
+    seen = _record_readiness_urls(monkeypatch)
+    client = _EndpointClient(operating_system, gateway)
+    provisioner = DockerRuntimeProvisioner(tmp_path, client=client)
+    _configure(provisioner)
+    running = provisioner.start(
+        _record(tmp_path),
+        {"QWENPAW_RUNTIME_INTERNAL_TOKEN": "runtime-token"},
+    )
+    return running.host, seen, provisioner
+
+
+@pytest.mark.parametrize(
+    ("platform", "operating_system", "gateway"),
+    [
+        ("linux", "Docker Desktop", "172.17.0.1"),
+        ("linux", "Ubuntu", "172.17.0.1"),
+        ("win32", "Docker Desktop", None),
+    ],
+)
+def test_host_deployment_probes_published_loopback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    platform: str,
+    operating_system: str,
+    gateway: str | None,
+) -> None:
+    host, urls, provisioner = _start_for_endpoint(
+        tmp_path,
+        monkeypatch,
+        in_container=False,
+        platform=platform,
+        operating_system=operating_system,
+        gateway=gateway,
+    )
+
+    assert host == "127.0.0.1"
+    assert urls == [
+        "http://127.0.0.1:32123/api/version",
+        "http://127.0.0.1:32123/api/version",
+    ]
+    assert provisioner.managed_endpoint_allowed("127.0.0.1")
+    assert not provisioner.managed_endpoint_allowed(
+        "host.docker.internal",
+    )
+    assert not provisioner.managed_endpoint_allowed("192.0.2.10")
+    if gateway is not None:
+        assert not provisioner.managed_endpoint_allowed(gateway)
+
+
+@pytest.mark.parametrize(
+    ("platform", "operating_system", "gateway", "host"),
+    [
+        (
+            "linux",
+            "Docker Desktop",
+            "172.17.0.1",
+            "host.docker.internal",
+        ),
+        ("darwin", "Docker Desktop", None, "host.docker.internal"),
+        ("linux", "Ubuntu", "172.17.0.1", "172.17.0.1"),
+        ("linux", "Ubuntu", "192.168.40.1", "192.168.40.1"),
+    ],
+)
+def test_container_deployment_probes_model_network_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    platform: str,
+    operating_system: str,
+    gateway: str | None,
+    host: str,
+) -> None:
+    resolved, urls, provisioner = _start_for_endpoint(
+        tmp_path,
+        monkeypatch,
+        in_container=True,
+        platform=platform,
+        operating_system=operating_system,
+        gateway=gateway,
+    )
+
+    assert resolved == host
+    assert urls == [
+        f"http://{host}:32123/api/version",
+        f"http://{host}:32123/api/version",
+    ]
+    assert provisioner.managed_endpoint_allowed(host)
+    assert provisioner.managed_endpoint_allowed("127.0.0.1")
+    assert not provisioner.managed_endpoint_allowed("192.0.2.10")
+    assert not provisioner.managed_endpoint_allowed("10.0.0.8")
+    if host != "host.docker.internal":
+        assert not provisioner.managed_endpoint_allowed(
+            "host.docker.internal",
+        )
+
+
 def _configure(provisioner: DockerRuntimeProvisioner) -> None:
     provisioner.configure(
         {
