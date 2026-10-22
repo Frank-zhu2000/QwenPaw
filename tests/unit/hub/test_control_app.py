@@ -4,11 +4,13 @@
 from collections.abc import AsyncIterator, Iterator, Mapping
 import asyncio
 from contextlib import closing
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import gzip
 import json
 from pathlib import Path
+import socket
 import sqlite3
 import threading
 import time
@@ -1156,6 +1158,69 @@ def test_proxy_uses_container_runtime_endpoint(tmp_path: Path) -> None:
     assert any("host.docker.internal" in url for url in seen)
     assert rejected.status_code == 503
     assert "loopback-only" in rejected.json()["detail"]
+
+
+def _closed_tcp_port() -> int:
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = int(sock.getsockname()[1])
+    sock.close()
+    return port
+
+
+def test_runtime_clients_ignore_env_proxy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runtime HTTP calls must not follow HTTP_PROXY."""
+    proxy = f"http://127.0.0.1:{_closed_tcp_port()}"
+    for name in (
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ):
+        monkeypatch.setenv(name, proxy)
+    monkeypatch.setenv("NO_PROXY", "")
+    monkeypatch.setenv("no_proxy", "")
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            assert self.headers.get("X-QwenPaw-Runtime-Token")
+            body = b"ok"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args: object) -> None:
+            return
+
+    server = HTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    port = int(server.server_address[1])
+    try:
+        with _client(tmp_path, runtime_port=port) as client:
+            token = _register(client, "owner")
+            probed = client.get("/api/probe", headers=_headers(token))
+            assert probed.status_code == 200
+            assert probed.text == "ok"
+            runtime_id = client.app.state.runtime_service.registry.list()[
+                0
+            ].runtime_id
+            callback = client.get(
+                "/api/hub/oauth/callback/"
+                f"{runtime_id}/providers/openrouter",
+                params={"code": "c", "state": "s"},
+            )
+            assert callback.status_code == 200
+            assert callback.text == "ok"
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def test_proxy_rejects_declared_request_body_over_limit(

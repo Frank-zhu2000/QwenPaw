@@ -1504,6 +1504,7 @@ def create_hub_app(  # pylint: disable=too-many-statements
         try:
             async with httpx.AsyncClient(
                 transport=proxy_transport,
+                trust_env=False,
             ) as client:
                 upstream = await client.get(
                     target,
@@ -1676,6 +1677,7 @@ def create_hub_app(  # pylint: disable=too-many-statements
         client = httpx.AsyncClient(
             timeout=timeout,
             transport=proxy_transport,
+            trust_env=False,
         )
         request_complete = asyncio.Event()
         try:

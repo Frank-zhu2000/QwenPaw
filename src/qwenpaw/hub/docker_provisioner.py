@@ -78,6 +78,67 @@ else:
     _DockerNotFound = docker.errors.NotFound
 
 
+_SYS_CLASS_NET = Path("/sys/class/net")
+_PROC_NET_ROUTE = Path("/proc/net/route")
+
+
+def _open_readiness(
+    request: str | urllib.request.Request,
+    timeout: float,
+) -> Any:
+    """Open a runtime URL without honoring HTTP(S)_PROXY or ALL_PROXY."""
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+    )
+    return opener.open(request, timeout=timeout)
+
+
+def _shares_engine_netns() -> bool:
+    """Return whether this process can see the engine's bridge devices.
+
+    ``--network host`` shares the engine netns, so ``127.0.0.1`` is the
+    published loopback. A bridge container does not see ``docker0`` or
+    ``br-*``.
+    """
+    try:
+        names = [entry.name for entry in _SYS_CLASS_NET.iterdir()]
+    except OSError:
+        return False
+    return any(name == "docker0" or name.startswith("br-") for name in names)
+
+
+def _private_default_gateway(route_text: str) -> str:
+    """Return the private IPv4 default gateway from ``/proc/net/route``."""
+    for line in route_text.splitlines():
+        fields = line.split()
+        if len(fields) < 3 or fields[1] != "00000000":
+            continue
+        try:
+            raw = bytes.fromhex(fields[2])
+        except ValueError:
+            continue
+        if len(raw) != 4:
+            continue
+        address = ipaddress.IPv4Address(raw[::-1])
+        if address.is_private and not (
+            address.is_loopback
+            or address.is_unspecified
+            or address.is_link_local
+            or address.is_multicast
+        ):
+            return str(address)
+    return ""
+
+
+def _container_default_gateway() -> str:
+    """Return this process's private IPv4 default gateway, or empty."""
+    try:
+        text = _PROC_NET_ROUTE.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    return _private_default_gateway(text)
+
+
 class DockerRuntimeProvisioner(RuntimeProvisioner):
     """Run managed QwenPaw instances as Docker containers."""
 
@@ -122,24 +183,63 @@ class DockerRuntimeProvisioner(RuntimeProvisioner):
                 return RuntimeModelNetwork(str(address), str(address))
         raise RuntimeError("Docker bridge has no private IPv4 gateway")
 
-    def endpoint_host(self) -> str:
-        """Return the address Hub uses to reach a published runtime port.
+    def _uses_desktop_loopback_alias(self) -> bool:
+        """Return whether host.docker.internal reaches the loopback publish."""
+        if sys.platform in {"darwin", "win32"}:
+            return True
+        operating_system = str(
+            self._get_client().info().get("OperatingSystem", ""),
+        )
+        return "docker desktop" in operating_system.lower()
 
-        A Hub on the host shares the engine loopback where the port is
-        published. A Hub inside a container uses the same host
-        ``model_network()`` gives that container for the engine:
-        ``host.docker.internal`` on Docker Desktop, or the bridge
-        gateway on native Linux.
+    def _ensure_endpoints(self) -> None:
+        """Cache the dial address and the host IP Docker must bind.
+
+        The dial address has to be the socket that receives the publish.
+        ``host.docker.internal`` does that on Docker Desktop. A native
+        bridge gateway does not reach a port bound only on ``127.0.0.1``,
+        so the publish moves to the Hub container's own default gateway.
         """
-        cached = getattr(self, "_endpoint_host", None)
-        if isinstance(cached, str):
-            return cached
+        if isinstance(getattr(self, "_endpoint_host", None), str):
+            return
+        publish, dial = self._resolve_publish_and_dial()
+        self._publish_host = publish
+        self._endpoint_host = dial
+
+    def _resolve_publish_and_dial(self) -> tuple[str, str]:
+        """Return ``(publish_host, dial_host)`` for this process."""
         if not is_running_in_container():
-            resolved = "127.0.0.1"
-        else:
-            resolved = self.model_network().runtime_host
-        self._endpoint_host = resolved
-        return resolved
+            return "127.0.0.1", "127.0.0.1"
+        if self._uses_desktop_loopback_alias():
+            return "127.0.0.1", "host.docker.internal"
+        if not _shares_engine_netns():
+            self._get_network()
+        if _shares_engine_netns():
+            return "127.0.0.1", "127.0.0.1"
+        gateway = _container_default_gateway()
+        if not gateway:
+            raise RuntimeError(
+                "In-container Hub cannot reach a loopback published "
+                "port on this engine, and no private IPv4 default "
+                "gateway is available to publish on.",
+            )
+        return gateway, gateway
+
+    def _runtime_publish_host(self) -> str:
+        """Return the host IP bound for the runtime API port."""
+        self._ensure_endpoints()
+        return str(self._publish_host)
+
+    def endpoint_host(self) -> str:
+        """Return the address Hub dials for the published runtime port.
+
+        Host processes dial ``127.0.0.1``. Docker Desktop containers dial
+        ``host.docker.internal``, which reaches the loopback publish.
+        Other engines dial ``127.0.0.1`` on a shared engine netns, or the
+        container's private default gateway when that IP is the publish.
+        """
+        self._ensure_endpoints()
+        return str(self._endpoint_host)
 
     def managed_endpoint_allowed(self, host: str) -> bool:
         """Allow loopback or this deployment's single container route."""
@@ -246,6 +346,7 @@ class DockerRuntimeProvisioner(RuntimeProvisioner):
             if credentials.get(name):
                 environment[name] = credentials[name]
         labels = self._labels(record.runtime_id, record.owner_user_id)
+        publish_host = self._runtime_publish_host()
         container = self._get_client().containers.run(
             launch_image,
             detach=True,
@@ -255,7 +356,7 @@ class DockerRuntimeProvisioner(RuntimeProvisioner):
             init=True,
             labels=labels,
             name=self._container_name(record.runtime_id),
-            ports={"8088/tcp": ("127.0.0.1", None)},
+            ports={"8088/tcp": (publish_host, None)},
             restart_policy={"Name": "no"},
             security_opt=["no-new-privileges:true"],
             volumes={
@@ -275,7 +376,7 @@ class DockerRuntimeProvisioner(RuntimeProvisioner):
             **self._resource_limits(),
         )
         try:
-            port = self._published_port(container)
+            port = self._published_port(container, publish_host)
             starting = replace(
                 record,
                 host=self.endpoint_host(),
@@ -600,24 +701,28 @@ class DockerRuntimeProvisioner(RuntimeProvisioner):
         return f"qwenpaw-hub-{self._instance_id}-{runtime_id}"
 
     @staticmethod
-    def _published_port(container: Any) -> int:
+    def _published_port(
+        container: Any,
+        publish_host: str = "127.0.0.1",
+    ) -> int:
+        """Return the host port bound on ``publish_host``."""
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             container.reload()
             bindings = (
                 container.attrs.get("NetworkSettings", {})
-                .get(
-                    "Ports",
-                    {},
-                )
+                .get("Ports", {})
                 .get("8088/tcp")
             )
             if bindings:
                 host_ip = str(bindings[0].get("HostIp") or "")
-                if host_ip not in {"127.0.0.1", "::1"}:
+                loopback = publish_host in {"127.0.0.1", "::1"}
+                allowed = {"127.0.0.1", "::1"} if loopback else {publish_host}
+                if host_ip not in allowed:
+                    where = "loopback" if loopback else publish_host
                     raise RuntimeError(
-                        "Docker published the runtime outside loopback: "
-                        f"{host_ip or 'unknown'}",
+                        "Docker published the runtime outside "
+                        f"{where}: {host_ip or 'unknown'}",
                     )
                 return int(bindings[0]["HostPort"])
             time.sleep(0.1)
@@ -657,7 +762,7 @@ class DockerRuntimeProvisioner(RuntimeProvisioner):
         last_error = "readiness endpoint was not reachable"
         while time.monotonic() < deadline:
             try:
-                with urllib.request.urlopen(url, timeout=1) as response:
+                with _open_readiness(url, timeout=1) as response:
                     if 200 <= response.status < 300:
                         return "loopback_only"
                     last_error = (
@@ -674,7 +779,7 @@ class DockerRuntimeProvisioner(RuntimeProvisioner):
                         },
                     )
                     try:
-                        with urllib.request.urlopen(
+                        with _open_readiness(
                             request,
                             timeout=2,
                         ) as response:
