@@ -298,14 +298,82 @@ def _load_persisted_cors_origin(
         '{"QWENPAW_CORS_ORIGINS": "enc:' + origin + '"}',
         encoding="utf-8",
     )
-    # delenv records the previous process value so the test cannot leak it.
-    monkeypatch.delenv("QWENPAW_CORS_ORIGINS", raising=False)
+    # setenv records an undo even when the key was absent. delenv does
+    # not, so the value load_envs_into_environ() writes would leak.
+    monkeypatch.setenv(
+        "QWENPAW_CORS_ORIGINS",
+        os.environ.get("QWENPAW_CORS_ORIGINS", ""),
+    )
     try:
         store.load_envs_into_environ()
         assert os.environ["QWENPAW_CORS_ORIGINS"] == origin
     finally:
         host_values.clear()
         host_values.update(saved_host)
+
+
+def _cors_origin_set(value: str) -> set[str]:
+    return {item.strip() for item in value.split(",") if item.strip()}
+
+
+def test_desktop_flag_keeps_tauri_origins_after_second_env_load(
+    monkeypatch,
+    tmp_path,
+):
+    """Persisted origins must not drop the desktop webview origins."""
+    from qwenpaw.constant import get_cors_origins
+    from qwenpaw.envs import store
+    from qwenpaw.tauri.env import ensure_desktop_cors_origins
+
+    origin = "https://console.example.test"
+    monkeypatch.setenv("QWENPAW_DESKTOP_APP", "1")
+    _load_persisted_cors_origin(monkeypatch, tmp_path, origin)
+    ensure_desktop_cors_origins()
+    store.load_envs_into_environ()
+    assert os.environ["QWENPAW_CORS_ORIGINS"] == origin
+    assert _cors_origin_set(get_cors_origins()) == {
+        origin,
+        "tauri://localhost",
+        "https://tauri.localhost",
+        "http://tauri.localhost",
+    }
+
+
+def test_desktop_flag_off_does_not_add_tauri_origins(
+    monkeypatch,
+    tmp_path,
+):
+    """With the desktop flag off, a reload does not add Tauri origins."""
+    from qwenpaw.constant import get_cors_origins
+    from qwenpaw.envs import store
+    from qwenpaw.tauri.env import ensure_desktop_cors_origins
+
+    origin = "https://console.example.test"
+    monkeypatch.delenv("QWENPAW_DESKTOP_APP", raising=False)
+    _load_persisted_cors_origin(monkeypatch, tmp_path, origin)
+    ensure_desktop_cors_origins()
+    store.load_envs_into_environ()
+    assert os.environ["QWENPAW_CORS_ORIGINS"] == origin
+    assert _cors_origin_set(get_cors_origins()) == {origin}
+
+
+def test_persisted_cors_loader_restores_absent_env(tmp_path):
+    """Helper teardown must drop an origin the process did not have."""
+    from pytest import MonkeyPatch
+
+    origin = "https://console.example.test"
+    previous = os.environ.pop("QWENPAW_CORS_ORIGINS", None)
+    patch = MonkeyPatch()
+    try:
+        _load_persisted_cors_origin(patch, tmp_path, origin)
+        assert os.environ["QWENPAW_CORS_ORIGINS"] == origin
+        patch.undo()
+        assert "QWENPAW_CORS_ORIGINS" not in os.environ
+    finally:
+        if previous is None:
+            os.environ.pop("QWENPAW_CORS_ORIGINS", None)
+        else:
+            os.environ["QWENPAW_CORS_ORIGINS"] = previous
 
 
 def test_cors_origin_loaded_after_import_is_allowed(
