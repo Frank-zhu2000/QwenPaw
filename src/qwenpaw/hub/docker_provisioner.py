@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from ..config.utils import is_running_in_container
+from ..utils.http import is_loopback_host
 from .credentials import runtime_credential_name_allowed
 from .models import RuntimeRecord, RuntimeState
 from .user_profile import runtime_workspace
@@ -752,6 +753,18 @@ class DockerRuntimeProvisioner(RuntimeProvisioner):
         metadata["docker"] = docker_config
         return metadata
 
+    def _published_on_loopback(self, record: RuntimeRecord) -> bool:
+        """Return whether anonymous readiness stays on a loopback publish.
+
+        Docker start caches the publish address before this probe. Desktop
+        publishes on loopback and dials ``host.docker.internal``. A bridge
+        container publishes on its private gateway, which neighbors can
+        route to, so an open API is not an acceptable boundary there.
+        """
+        publish = getattr(self, "_publish_host", None)
+        host = publish if isinstance(publish, str) and publish else record.host
+        return is_loopback_host(host)
+
     def _wait_until_ready(
         self,
         record: RuntimeRecord,
@@ -764,7 +777,15 @@ class DockerRuntimeProvisioner(RuntimeProvisioner):
             try:
                 with _open_readiness(url, timeout=1) as response:
                     if 200 <= response.status < 300:
-                        return "loopback_only"
+                        if self._published_on_loopback(record):
+                            return "loopback_only"
+                        raise RuntimeError(
+                            "Docker runtime "
+                            f"{record.runtime_id} failed security "
+                            "readiness: anonymous HTTP 200 on a "
+                            "non-loopback publish; a runtime token "
+                            "boundary is required",
+                        )
                     last_error = (
                         f"readiness endpoint returned {response.status}"
                     )

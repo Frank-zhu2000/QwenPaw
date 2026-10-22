@@ -766,6 +766,147 @@ def test_readiness_accepts_loopback_only_legacy_image(
     assert result == "loopback_only"
 
 
+def test_readiness_rejects_anonymous_success_on_gateway_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An open API on a gateway publish must not become ready."""
+    provisioner = DockerRuntimeProvisioner(
+        tmp_path,
+        start_timeout=0.1,
+        client=_FakeClient(),
+    )
+    provisioner._publish_host = (  # pylint: disable=protected-access
+        "172.18.0.1"
+    )
+    calls: list[str | urllib.request.Request] = []
+
+    class _Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+    def urlopen(
+        request: str | urllib.request.Request,
+        timeout: int,
+    ) -> _Response:
+        del timeout
+        calls.append(request)
+        return _Response()
+
+    monkeypatch.setattr(docker_module, "_open_readiness", urlopen)
+    record = replace(_record(tmp_path), host="172.18.0.1", port=8088)
+
+    with pytest.raises(RuntimeError, match="non-loopback"):
+        provisioner._wait_until_ready(  # pylint: disable=protected-access
+            record,
+            "runtime-token",
+        )
+
+    assert calls
+    assert all(isinstance(call, str) for call in calls)
+
+
+def test_readiness_accepts_token_boundary_on_gateway_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A gateway publish is allowed once anonymous access is rejected."""
+    provisioner = DockerRuntimeProvisioner(
+        tmp_path,
+        start_timeout=0.1,
+        client=_FakeClient(),
+    )
+    provisioner._publish_host = (  # pylint: disable=protected-access
+        "172.18.0.1"
+    )
+    calls: list[str | urllib.request.Request] = []
+
+    class _Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+    def urlopen(
+        request: str | urllib.request.Request,
+        timeout: int,
+    ) -> _Response:
+        del timeout
+        calls.append(request)
+        if isinstance(request, str):
+            raise urllib.error.HTTPError(
+                request,
+                401,
+                "Unauthorized",
+                Message(),
+                None,
+            )
+        return _Response()
+
+    monkeypatch.setattr(docker_module, "_open_readiness", urlopen)
+    record = replace(_record(tmp_path), host="172.18.0.1", port=8088)
+
+    result = provisioner._wait_until_ready(  # pylint: disable=protected-access
+        record,
+        "runtime-token",
+    )
+
+    assert result == "token"
+    token_request = calls[1]
+    assert isinstance(token_request, urllib.request.Request)
+    assert token_request.get_header("X-qwenpaw-runtime-token") == (
+        "runtime-token"
+    )
+
+
+def test_readiness_accepts_legacy_image_when_publish_is_loopback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Loopback publish still accepts a legacy image without a token."""
+    provisioner = DockerRuntimeProvisioner(
+        tmp_path,
+        start_timeout=0.1,
+        client=_FakeClient(),
+    )
+    provisioner._publish_host = "127.0.0.1"  # pylint: disable=protected-access
+
+    class _Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+    monkeypatch.setattr(
+        docker_module,
+        "_open_readiness",
+        lambda *_args, **_kwargs: _Response(),
+    )
+    record = replace(
+        _record(tmp_path),
+        host="host.docker.internal",
+        port=8088,
+    )
+
+    result = provisioner._wait_until_ready(  # pylint: disable=protected-access
+        record,
+        "runtime-token",
+    )
+
+    assert result == "loopback_only"
+
+
 def _closed_tcp_port() -> int:
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))

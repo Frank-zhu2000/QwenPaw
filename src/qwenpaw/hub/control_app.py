@@ -314,6 +314,26 @@ def create_hub_app(  # pylint: disable=too-many-statements
             query=query,
         )
 
+    async def runtime_target(
+        record: RuntimeRecord,
+        *,
+        scheme: str,
+        path: str,
+        query: bytes = b"",
+    ) -> httpx.URL:
+        """Resolve a runtime URL off the event loop.
+
+        The allow check can ask Docker for the dial host the first time
+        a non-loopback address is seen. Later calls use that cache.
+        """
+        return await run_in_threadpool(
+            runtime_url,
+            record,
+            scheme=scheme,
+            path=path,
+            query=query,
+        )
+
     def require_user(
         authorization: str | None = Header(default=None),
     ) -> HubUser:
@@ -1484,7 +1504,7 @@ def create_hub_app(  # pylint: disable=too-many-statements
                 status_code=503,
                 detail="OAuth callback runtime is not running",
             )
-        target = runtime_url(
+        target = await runtime_target(
             record,
             scheme="http",
             path=callback_path,
@@ -1563,7 +1583,7 @@ def create_hub_app(  # pylint: disable=too-many-statements
             trust_env=False,
         ) as client:
             upstream = await client.get(
-                runtime_url(
+                await runtime_target(
                     record,
                     scheme="http",
                     path=f"/api/pawapps/{app_id}",
@@ -1603,7 +1623,7 @@ def create_hub_app(  # pylint: disable=too-many-statements
         require_model_route(path, request.method)
         record = await ensure_personal_runtime(user)
         require_session_runtime(request, record)
-        target = runtime_url(
+        target = await runtime_target(
             record,
             scheme="http",
             path=f"/api/{path}",
@@ -1795,7 +1815,7 @@ def create_hub_app(  # pylint: disable=too-many-statements
             return
         try:
             record = await ensure_personal_runtime(user)
-            target = runtime_url(
+            target = await runtime_target(
                 record,
                 scheme="ws",
                 path=f"/api/{path}",
