@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 """Validate terminal boundary, directory resolution and payload contracts."""
 
+import os
 import threading
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
@@ -250,6 +252,113 @@ def test_loopback_development_origin_is_allowed(client):
     http, manager = client
     path = f"http://127.0.0.1:8001/api/terminals/{uuid4()}"
     response = http.post(path, headers={"Origin": "http://localhost:5173"})
+    assert response.status_code == 200
+    manager.create.assert_called_once()
+
+
+def _load_persisted_cors_origin(
+    monkeypatch,
+    tmp_path,
+    origin,
+):
+    """Apply QWENPAW_CORS_ORIGINS the way the Web UI / CLI store does."""
+    from qwenpaw.envs import store
+
+    @contextmanager
+    def _noop_lock():
+        yield
+
+    monkeypatch.setattr(
+        "qwenpaw.backup._utils.safe_swap.restore_process_lock",
+        _noop_lock,
+    )
+    monkeypatch.setattr(
+        "qwenpaw.backup._utils.safe_swap.cleanup_stale_restore_artifacts",
+        lambda _base_dir: None,
+    )
+    path = tmp_path / "envs.json"
+    monkeypatch.setattr(store, "_ENVS_JSON", path)
+    monkeypatch.setattr(store, "_LEGACY_ENVS_JSON_CANDIDATES", ())
+    monkeypatch.setattr(store, "_BOOTSTRAP_SECRET_DIR", tmp_path)
+    monkeypatch.setattr(store, "encrypt", lambda value: f"enc:{value}")
+    monkeypatch.setattr(
+        store,
+        "is_encrypted",
+        lambda value: isinstance(value, str) and value.startswith("enc:"),
+    )
+    monkeypatch.setattr(
+        store,
+        "decrypt",
+        lambda value: value.removeprefix("enc:"),
+    )
+    host_values = store._HOST_ENV_VALUES  # pylint: disable=protected-access
+    saved_host = dict(host_values)
+    host_values.clear()
+    path.write_text(
+        '{"QWENPAW_CORS_ORIGINS": "enc:' + origin + '"}',
+        encoding="utf-8",
+    )
+    # delenv records the previous process value so the test cannot leak it.
+    monkeypatch.delenv("QWENPAW_CORS_ORIGINS", raising=False)
+    try:
+        store.load_envs_into_environ()
+        assert os.environ["QWENPAW_CORS_ORIGINS"] == origin
+    finally:
+        host_values.clear()
+        host_values.update(saved_host)
+
+
+def test_cors_origin_loaded_after_import_is_allowed(
+    client,
+    monkeypatch,
+    tmp_path,
+):
+    """Env-store origins applied after import must allow terminal POSTs."""
+    from qwenpaw.constant import CORS_ORIGINS
+
+    origin = "https://console.example.test"
+    # constant.py reads QWENPAW_CORS_ORIGINS at import, before envs load.
+    assert origin not in {value.strip() for value in CORS_ORIGINS.split(",")}
+    _load_persisted_cors_origin(monkeypatch, tmp_path, origin)
+    http, manager = client
+    response = http.post(
+        f"/api/terminals/{uuid4()}",
+        headers={"Origin": origin},
+    )
+    assert response.status_code == 200
+    manager.create.assert_called_once()
+
+
+def test_unset_cors_origins_keep_default_cross_site_rejection(
+    client,
+    monkeypatch,
+):
+    """With the variable unset, non-loopback cross-site posts stay rejected."""
+    monkeypatch.delenv("QWENPAW_CORS_ORIGINS", raising=False)
+    http, manager = client
+    response = http.post(
+        f"/api/terminals/{uuid4()}",
+        headers={"Origin": "https://attacker.test"},
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"] == (
+        "Cross-site terminal request rejected"
+    )
+    manager.create.assert_not_called()
+
+
+def test_process_env_cors_origin_present_at_start_is_allowed(
+    client,
+    monkeypatch,
+):
+    """An origin exported before startup is still accepted."""
+    origin = "https://startup.example.test"
+    monkeypatch.setenv("QWENPAW_CORS_ORIGINS", origin)
+    http, manager = client
+    response = http.post(
+        f"/api/terminals/{uuid4()}",
+        headers={"Origin": origin},
+    )
     assert response.status_code == 200
     manager.create.assert_called_once()
 

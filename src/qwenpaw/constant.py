@@ -303,7 +303,15 @@ MEMORY_COMPACT_RATIO = EnvVarLoader.get_float(
 # CORS configuration — comma-separated list of allowed origins for dev mode.
 # Example: QWENPAW_CORS_ORIGINS="http://localhost:5173,http://127.0.0.1:5173"
 # When unset, CORS middleware is not applied.
+# This value is captured at import, before load_envs_into_environ().
+# Origin checks must call get_cors_origins() so later env settings apply.
 CORS_ORIGINS = EnvVarLoader.get_str("QWENPAW_CORS_ORIGINS", "").strip()
+
+
+def get_cors_origins() -> str:
+    """Return QWENPAW_CORS_ORIGINS from the live process environment."""
+    return EnvVarLoader.get_str("QWENPAW_CORS_ORIGINS", "").strip()
+
 
 # Upload size limit (MB).  None = no limit.
 UPLOAD_MAX_SIZE_MB: int | None = (
