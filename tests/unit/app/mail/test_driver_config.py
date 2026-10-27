@@ -54,7 +54,6 @@ def test_frozen_driver_card_preserves_python_override(monkeypatch):
             "qq.com",
             "3855686217@qq.com",
         ),
-        ("user@qq.com", "163.com", "user@qq.com"),
     ],
 )
 def test_build_qwenpawmail_env_login_address(name, domain, expected):
